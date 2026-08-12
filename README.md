@@ -154,7 +154,7 @@ out = out_proj(out)
 
 ## Initialization and Learning Rate
 
-The recommended initialization depends on whether the **convolution-affected representation is normalized before it contributes to the residual stream**.
+The recommended initialization and learning rate depends on whether the **convolution-affected representation is normalized before it contributes to the residual stream**.
 
 For the query and key convolutions, this corresponds to normalizing the convolved Q/K representations before attention, e.g. with QK normalization.
 
