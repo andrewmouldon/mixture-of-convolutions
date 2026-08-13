@@ -145,7 +145,7 @@ out = sequence_mixer(
 
 out = out.transpose(1, 2).contiguous().view(B, T, v_dim)
 
-# If used by the architecture, normalize the retrieved /
+# If used by the architecture, normalize the retrieved value /
 # sequence-mixing output before the output projection.
 #out = out_norm(out)
 
