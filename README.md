@@ -1,6 +1,6 @@
 # Mixture of Convolutions (Triton)
 
-Triton kernels for **Mixture of Convolutions (MoC)**, a token-adaptive generalization of short causal depthwise convolution.
+Triton kernels for **Mixture of Convolutions (MoC)**, a token-adaptive generalization of short convolution.
 
 Standard short convolution applies the same learned kernel at every sequence position. MoC instead learns a bank of convolutional bases and uses a token-dependent router to mix them into a different effective kernel at each position.
 
@@ -154,28 +154,26 @@ out = out_proj(out)
 
 ## Initialization and Learning Rate
 
-The recommended initialization and learning rate depends on whether the **convolution-affected representation is normalized before it contributes to the residual stream**.
+The appropriate initialization depends on how the architecture controls the forward scale of the convolution-affected computation.
 
-For the query and key convolutions, this corresponds to normalizing the convolved Q/K representations before attention, e.g. with QK normalization.
+MoC can be initialized at a very small scale when a downstream normalization prevents that small parameter scale from substantially changing the scale of the representation seen by the rest of the model. Otherwise, a variance-preserving fan-in initialization is a safer default.
 
-For the value convolution, the relevant normalization is applied **after sequence mixing** to the retrieved value / attention output, before the output projection and residual update.
+The normalization does not necessarily need to be applied immediately after the convolution. For example, in the experiments in the paper:
 
-This post-sequence-mixing normalization is already part of architectures such as Gated DeltaNet. It is not part of a standard Transformer block.
+* convolved queries and keys are normalized before attention using QK normalization;
+* convolved values are not normalized directly, but the retrieved value / sequence-mixing output is normalized before the output projection.
 
-### With downstream normalization
+Thus, the relevant question is not strictly *where* normalization occurs, but whether the architecture keeps the output scale of the convolution-affected computation well controlled.
 
-If the convolution-affected representation is normalized downstream — for example:
+### Small initialization with downstream scale normalization
 
-- Q/K are normalized after convolution and before attention, and
-- the sequence-mixing output is normalized before the output projection / residual update,
-
-use:
+When the architecture provides suitable downstream normalization, use:
 
 ```python
 init_std = 0.002
 ```
 
-with a standard learning rate such as:
+with a standard AdamW learning rate such as:
 
 ```text
 AdamW LR = 1e-3
@@ -183,9 +181,11 @@ AdamW LR = 1e-3
 
 This is the recipe used in the main experiments.
 
-### Without downstream normalization
+For the Transformer experiments, Q/K normalization controls the scale of the convolved queries and keys, while per-head normalization of the sequence-mixing output controls the value path. Gated DeltaNet already includes analogous post-sequence-mixing normalization.
 
-If the convolution output is allowed to determine the forward scale directly, as in a standard Transformer without post-sequence-mixing normalization, use the default fan-in initialization to preserve variance:
+### Fan-in initialization without downstream scale normalization
+
+If the convolution-affected computation is not otherwise normalized and its scale directly propagates through the model, use the default variance-preserving initialization:
 
 ```python
 moc = MoC(
@@ -203,25 +203,28 @@ For `K` bases and kernel size `S`, the default initialization has standard devia
 fan_in_std = sqrt(K / (3 * S))
 ```
 
-The convolution learning rate should then be increased proportionally to the initialization scale so that the initial optimizer update remains approximately matched relative to the parameter scale:
+When using the larger fan-in initialization, scale the convolution learning rate proportionally with the initialization scale. This keeps the optimizer update in roughly the same regime relative to the parameter scale and is important for obtaining good performance.
 
-```text
+```
 matched_lr = reference_lr * init_std / reference_std
 ```
 
 Using the paper reference values:
 
-```text
+```
 reference_std = 0.002
 reference_lr  = 1e-3
 ```
 
 For `K = 16` and `S = 4`:
 
-```text
+```
 fan_in_std ≈ 1.1547
 matched_lr ≈ 0.577
 ```
+
+This scaling moves the convolution learning rate into the appropriate range (with Adam) when changing the initialization scale. It is not meant to replace a learning-rate sweep within that range.
+
 
 Helpers are provided in `moc.optim`:
 
