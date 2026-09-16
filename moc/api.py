@@ -14,10 +14,19 @@ from .optim import moc_fan_in_std
 
 SUPPORTED_DTYPES = (torch.bfloat16, torch.float32)
 
+
 def activation_flag(activation: str | None) -> int:
     if activation not in (None, "silu", "swish"):
         raise ValueError(f"unsupported activation: {activation}")
     return int(activation is not None)
+
+
+def check_router_activation(router_activation: str) -> None:
+    if router_activation not in ("softmax", "exp"):
+        raise ValueError(
+            f"unsupported router activation: {router_activation}; "
+            "expected 'softmax' or 'exp'"
+        )
 
 
 def check_common_dtypes(x: torch.Tensor, alpha: torch.Tensor, basis: torch.Tensor) -> None:
@@ -81,7 +90,6 @@ def check_packed_inputs(
     if not isinstance(max_seqlen, int) or max_seqlen <= 0:
         raise ValueError("max_seqlen must be a positive Python int")
     return N, cu_seqlens.numel() - 1, D, K, KS
-
 
 
 class _MoCFunction(torch.autograd.Function):
@@ -336,15 +344,18 @@ class MoC(nn.Module):
         k: int,
         activation: str | None = None,
         init_std: float | None = None,
+        router_activation: str = "softmax",
     ) -> None:
         super().__init__()
         activation_flag(activation)
+        check_router_activation(router_activation)
 
         self.dim = dim
         self.z_dim = z_dim
         self.kernel_size = kernel_size
         self.k = k
         self.activation = activation
+        self.router_activation = router_activation
 
         self.conv_bases = nn.Parameter(torch.empty(k, kernel_size, dim))
         self.router = nn.Parameter(torch.zeros(k, z_dim))
@@ -357,7 +368,7 @@ class MoC(nn.Module):
             a=-init_std * math.sqrt(3),
             b=init_std * math.sqrt(3),
         )
-        
+
     def forward(
         self,
         x: torch.Tensor,
@@ -369,7 +380,13 @@ class MoC(nn.Module):
         cu_seqlens_cpu: Optional[torch.Tensor] = None,
         chunk_indices: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        alpha = torch.softmax(F.linear(z, self.router), dim=-1)
+        router_logits = F.linear(z, self.router)
+
+        if self.router_activation == "softmax":
+            alpha = torch.softmax(router_logits, dim=-1)
+        else:
+            alpha = torch.exp(router_logits)
+
         return moc_triton(
             x,
             alpha,
