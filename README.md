@@ -25,6 +25,8 @@ where:
 
 The Triton implementation fuses the basis mixture into the convolution and does not materialize the per-token dynamic kernels.
 
+`MoC` also supports unnormalized exponential routing via `router_activation="exp"`, which can be useful when a subsequent normalization makes the softmax denominator redundant.
+
 The implementation supports:
 
 * fixed-length sequences
@@ -88,6 +90,7 @@ self.q_conv = MoC(
     kernel_size=4,
     k=16,
     init_std=0.002,
+    router_activation="exp",
 )
 
 self.k_conv = MoC(
@@ -96,6 +99,7 @@ self.k_conv = MoC(
     kernel_size=4,
     k=16,
     init_std=0.002,
+    router_activation="exp",
 )
 
 self.v_conv = MoC(
@@ -147,7 +151,7 @@ out = out.transpose(1, 2).contiguous().view(B, T, v_dim)
 
 # If used by the architecture, normalize the retrieved value /
 # sequence-mixing output before the output projection.
-#out = out_norm(out)
+# out = out_norm(out)
 
 out = out_proj(out)
 ```
@@ -156,14 +160,14 @@ out = out_proj(out)
 
 The appropriate initialization depends on how the architecture controls the forward scale of the convolution-affected computation.
 
-MoC can be initialized at a very small scale when a downstream normalization prevents that small parameter scale from substantially changing the scale of the representation seen by the rest of the model. Otherwise, a variance-preserving fan-in initialization is a safer default.
+MoC can be initialized at a very small scale when a downstream normalization prevents that small parameter scale from substantially changing the scale of the representation seen by the rest of the model. Otherwise, a variance-preserving fan-in initialization is necessary.
 
 The normalization does not necessarily need to be applied immediately after the convolution. For example, in the experiments in the paper:
 
 * convolved queries and keys are normalized before attention using QK normalization;
 * convolved values are not normalized directly, but the retrieved value / sequence-mixing output is normalized before the output projection.
 
-Thus, the relevant question is not strictly *where* normalization occurs, but whether the architecture keeps the output scale of the convolution-affected computation well controlled.
+Use the small initialization with downstream normalization; otherwise use the fan-in initialization.
 
 ### Small initialization with downstream scale normalization
 
@@ -205,26 +209,25 @@ fan_in_std = sqrt(K / (3 * S))
 
 When using the larger fan-in initialization, scale the convolution learning rate proportionally with the initialization scale. This keeps the optimizer update in roughly the same regime relative to the parameter scale and is important for obtaining good performance.
 
-```
+```text
 matched_lr = reference_lr * init_std / reference_std
 ```
 
-Using the paper reference values:
+Without downstream scale normalization, use the more conservative reference values:
 
-```
-reference_std = 0.002
+```text
+reference_std = 0.01
 reference_lr  = 1e-3
 ```
 
 For `K = 16` and `S = 4`:
 
-```
+```text
 fan_in_std ≈ 1.1547
-matched_lr ≈ 0.577
+matched_lr ≈ 0.1155
 ```
 
-This scaling moves the convolution learning rate into the appropriate range (with Adam) when changing the initialization scale. It is not meant to replace a learning-rate sweep within that range.
-
+This scaling moves the convolution learning rate into an appropriate range when changing the initialization scale. It is not meant to replace a learning-rate sweep within that range.
 
 Helpers are provided in `moc.optim`:
 
@@ -242,7 +245,7 @@ init_std = moc_fan_in_std(
 
 conv_lr = match_lr_to_init_std(
     init_std,
-    reference_std=0.002,
+    reference_std=0.01,
     reference_lr=1e-3,
 )
 
@@ -253,11 +256,12 @@ conv_weight_decay = match_weight_decay_to_lr(
 )
 
 print(init_std)           # 1.1547...
-print(conv_lr)            # 0.5773...
-print(conv_weight_decay)  # 0.0001732...
+print(conv_lr)            # 0.1155...
+print(conv_weight_decay)  # 0.0008660...
 ```
 
 The weight decay is scaled inversely with the learning rate so that AdamW applies the same per-step multiplicative shrinkage as the reference configuration.
+
 ## Autoregressive Decoding
 
 `MoC` supports cached single-token decoding:
