@@ -4,6 +4,36 @@ import torch
 import torch.nn.functional as F
 
 
+def moc_routing_ref(
+    router_logits: torch.Tensor,
+    routing_activation: str = "exp",
+    routing_norm: str = "l2",
+) -> torch.Tensor:
+    """Convert router logits to MoC mixture coefficients.
+
+    Matches the routing choices in ``MoC``:
+      - routing_activation: ``"exp"`` or ``"softplus"``
+      - routing_norm: ``"l2"`` (default), ``"l1"``, or ``"none"``
+    """
+    routing_activation = routing_activation.lower()
+    routing_norm = routing_norm.lower()
+
+    if routing_activation == "exp":
+        r = torch.exp(router_logits)
+    elif routing_activation == "softplus":
+        r = F.softplus(router_logits)
+    else:
+        raise ValueError(f"unsupported routing activation: {routing_activation}")
+
+    if routing_norm == "none":
+        return r
+    if routing_norm == "l1":
+        return F.normalize(r, p=1, dim=-1)
+    if routing_norm == "l2":
+        return F.normalize(r, p=2, dim=-1)
+    raise ValueError(f"unsupported routing norm: {routing_norm}")
+
+
 def _postprocess(
     out: torch.Tensor,
     activation: str | None,
@@ -12,7 +42,6 @@ def _postprocess(
         if activation not in ("silu", "swish"):
             raise ValueError(f"unsupported activation: {activation}")
         out = F.silu(out)
-
     return out
 
 
@@ -23,7 +52,7 @@ def moc_ref(
     activation: str | None = None,
 ) -> torch.Tensor:
     # x:     [B, T, D]
-    # alpha: [B, T, K]
+    # alpha: [B, T, K] (already routed, e.g. via moc_routing_ref)
     # basis: [K, KS, D]
     ks = basis.shape[1]
     x_pad = F.pad(x, (0, 0, ks - 1, 0))
@@ -59,4 +88,4 @@ def moc_varlen_ref(
     return out.unsqueeze(0) if restore_batch_dim else out
 
 
-__all__ = ["moc_ref", "moc_varlen_ref"]
+__all__ = ["moc_routing_ref", "moc_ref", "moc_varlen_ref"]
