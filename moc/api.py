@@ -21,14 +21,6 @@ def activation_flag(activation: str | None) -> int:
     return int(activation is not None)
 
 
-def check_router_activation(router_activation: str) -> None:
-    if router_activation not in ("softmax", "exp"):
-        raise ValueError(
-            f"unsupported router activation: {router_activation}; "
-            "expected 'softmax' or 'exp'"
-        )
-
-
 def check_common_dtypes(x: torch.Tensor, alpha: torch.Tensor, basis: torch.Tensor) -> None:
     if not (x.is_cuda and alpha.is_cuda and basis.is_cuda):
         raise ValueError("x, alpha, and basis must all be CUDA tensors")
@@ -342,26 +334,35 @@ class MoC(nn.Module):
         z_dim: int,
         kernel_size: int,
         k: int,
+        routing_norm: str = "l2",
+        routing_activation: str = "exp",
         activation: str | None = None,
         init_std: float | None = None,
-        router_activation: str = "softmax",
     ) -> None:
         super().__init__()
         activation_flag(activation)
-        check_router_activation(router_activation)
 
         self.dim = dim
         self.z_dim = z_dim
         self.kernel_size = kernel_size
         self.k = k
         self.activation = activation
-        self.router_activation = router_activation
+
+        self.routing_activation = routing_activation.lower()
+        if self.routing_activation not in ("exp", "softplus"):
+            raise ValueError(
+                f"unsupported routing activation: {self.routing_activation}"
+            )
+
+        self.routing_norm = routing_norm.lower()
+        if self.routing_norm not in ("none", "l1", "l2"):
+            raise ValueError(f"unsupported routing norm: {self.routing_norm}")
 
         self.conv_bases = nn.Parameter(torch.empty(k, kernel_size, dim))
         self.router = nn.Parameter(torch.zeros(k, z_dim))
 
         if init_std is None:
-            init_std = moc_fan_in_std(k, kernel_size)
+            init_std = 1.0 / math.sqrt(3.0 * kernel_size)
 
         nn.init.uniform_(
             self.conv_bases,
@@ -382,10 +383,17 @@ class MoC(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         router_logits = F.linear(z, self.router)
 
-        if self.router_activation == "softmax":
-            alpha = torch.softmax(router_logits, dim=-1)
+        if self.routing_activation == "exp":
+            r = torch.exp(router_logits)
         else:
-            alpha = torch.exp(router_logits)
+            r = F.softplus(router_logits)
+        
+        if self.routing_norm == "none":
+            alpha = r
+        elif self.routing_norm == "l1":
+            alpha = F.normalize(r, p=1, dim=-1)
+        else:
+            alpha = F.normalize(r, p=2, dim=-1) 
 
         return moc_triton(
             x,
