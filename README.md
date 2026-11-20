@@ -1,276 +1,55 @@
 # Mixture of Convolutions (Triton)
 
-Triton kernels for **Mixture of Convolutions (MoC)**, a token-adaptive generalization of short convolution.
+Triton implementation of **Mixture of Convolutions (MoC)**, a token-adaptive generalization of short causal depthwise convolution.
 
-Standard short convolution applies the same learned kernel at every sequence position. MoC instead learns a bank of convolutional bases and uses a token-dependent router to mix them into a different effective kernel at each position.
+Instead of applying the same learned convolution kernel at every position, MoC learns a bank of convolutional bases and uses token-dependent routing weights to mix them into a different effective kernel at each position. The Triton kernels fuse this mixture into the convolution without materializing the dynamic kernels.
 
-## Math
-
-```text
-alpha[b,t,:] = softmax(router(z[b,t,:]))
-
-weight[b,t,s,d] = sum_k alpha[b,t,k] * basis[k,s,d]
-
-y[b,t,d] = sum_s weight[b,t,s,d] * x[b,t-s,d]
-```
-
-where:
-
-* `x` has shape `[B, T, D]`
-* `z` is the routing input
-* `alpha` has shape `[B, T, K]`
-* `basis` has shape `[K, S, D]`
-* `K` is the number of convolutional bases
-* `S` is the kernel size
-
-The Triton implementation fuses the basis mixture into the convolution and does not materialize the per-token dynamic kernels.
-
-`MoC` also supports unnormalized exponential routing via `router_activation="exp"`, which can be useful when a subsequent normalization makes the softmax denominator redundant.
-
-The implementation supports:
-
-* fixed-length sequences
-* packed variable-length sequences
-* autoregressive decoding with a convolution cache
-* optional fused SiLU activation
+Supports fixed-length sequences, packed variable-length sequences, autoregressive decoding with a convolution cache, and optional fused SiLU activation.
 
 ## Usage
-
-The high-level `MoC` module contains the learned convolutional bases and token router.
 
 ```python
 import torch
 from moc import MoC
 
-B, T, D = 4, 4096, 2048
-
 moc = MoC(
-    dim=D,
-    z_dim=D,
+    dim=2048,
+    z_dim=2048,
     kernel_size=4,
     k=16,
-    init_std=0.002,
+    routing_activation="exp",
+    routing_norm="l2",
 ).cuda().bfloat16()
 
-x = torch.randn(
-    B, T, D,
-    device="cuda",
-    dtype=torch.bfloat16,
-    requires_grad=True,
-)
-
-# Representation used by the router.
-# This does not need to be the same representation as x.
-z = torch.randn(
-    B, T, D,
-    device="cuda",
-    dtype=torch.bfloat16,
-    requires_grad=True,
-)
+x = torch.randn(4, 4096, 2048, device="cuda", dtype=torch.bfloat16)
+z = torch.randn(4, 4096, 2048, device="cuda", dtype=torch.bfloat16)
 
 y, _ = moc(x, z)
-
-y.sum().backward()
 ```
 
-`x` is the representation being convolved, while `z` determines the token-dependent mixture over convolutional bases.
+`x` is the representation being convolved, while `z` determines the token-dependent mixture. They do not need to be the same representation.
 
-## Example: Applying MoC to QKV
+## Recommended Settings
 
-MoC can replace static short convolutions on the projected queries, keys, and values of an attention or sequence-mixing layer.
+Unless you have a specific reason otherwise:
 
-Create separate MoC modules using the projected dimension of each representation:
+- **Routing normalization:** Use `routing_norm="l2"`.
+- **Routing activation:** Use `"exp"` or `"softplus"`. Softplus is a good starting point when the convolution directly interacts with the residual stream.
+- **Initialization:** Use the default `init_std=None`.
+- **Learning rate:** Use AdamW with a separate learning rate of approximately `0.01–0.03` for `conv_bases`.
+- **Weight decay:** Match the weight decay to your normal AdamW learning rate so the per-step shrinkage remains the same:
 
 ```python
-from moc import MoC
-
-self.q_conv = MoC(
-    dim=q_dim,
-    z_dim=d_model,
-    kernel_size=4,
-    k=16,
-    init_std=0.002,
-    router_activation="exp",
-)
-
-self.k_conv = MoC(
-    dim=k_dim,
-    z_dim=d_model,
-    kernel_size=4,
-    k=16,
-    init_std=0.002,
-    router_activation="exp",
-)
-
-self.v_conv = MoC(
-    dim=v_dim,
-    z_dim=d_model,
-    kernel_size=4,
-    k=16,
-    init_std=0.002,
-)
+conv_weight_decay = base_weight_decay * base_lr / conv_lr
 ```
 
-Inside a pre-norm block:
-
-```python
-x_norm = norm(x)
-
-# Project Q/K/V
-q, k, v = qkv_proj(x_norm).split(
-    [q_dim, k_dim, v_dim],
-    dim=-1,
-)
-
-# Apply token-adaptive short convolutions.
-# x_norm is used as the routing input for each convolution.
-q, _ = self.q_conv(q, x_norm)
-k, _ = self.k_conv(k, x_norm)
-v, _ = self.v_conv(v, x_norm)
-
-# Reshape into heads
-q = q.view(B, T, n_q_heads, q_head_dim).transpose(1, 2)
-k = k.view(B, T, n_kv_heads, k_head_dim).transpose(1, 2)
-v = v.view(B, T, n_kv_heads, v_head_dim).transpose(1, 2)
-
-# Per-head QK normalization
-q = q_norm(q)
-k = k_norm(k)
-
-# RoPE follows convolution and QK normalization
-q, k = apply_rope(q, k)
-
-out = sequence_mixer(
-    q,
-    k,
-    v,
-    is_causal=True,
-)
-
-out = out.transpose(1, 2).contiguous().view(B, T, v_dim)
-
-# If used by the architecture, normalize the retrieved value /
-# sequence-mixing output before the output projection.
-# out = out_norm(out)
-
-out = out_proj(out)
-```
-
-## Initialization and Learning Rate
-
-The appropriate initialization depends on how the architecture controls the forward scale of the convolution-affected computation.
-
-MoC can be initialized at a very small scale when a downstream normalization prevents that small parameter scale from substantially changing the scale of the representation seen by the rest of the model. Otherwise, a variance-preserving fan-in initialization is necessary.
-
-The normalization does not necessarily need to be applied immediately after the convolution. For example, in the experiments in the paper:
-
-* convolved queries and keys are normalized before attention using QK normalization;
-* convolved values are not normalized directly, but the retrieved value / sequence-mixing output is normalized before the output projection.
-
-Use the small initialization with downstream normalization; otherwise use the fan-in initialization.
-
-### Small initialization with downstream scale normalization
-
-When the architecture provides suitable downstream normalization, use:
-
-```python
-init_std = 0.002
-```
-
-with a standard AdamW learning rate such as:
-
-```text
-AdamW LR = 1e-3
-```
-
-This is the recipe used in the main experiments.
-
-For the Transformer experiments, Q/K normalization controls the scale of the convolved queries and keys, while per-head normalization of the sequence-mixing output controls the value path. Gated DeltaNet already includes analogous post-sequence-mixing normalization.
-
-### Fan-in initialization without downstream scale normalization
-
-If the convolution-affected computation is not otherwise normalized and its scale directly propagates through the model, use the default variance-preserving initialization:
-
-```python
-moc = MoC(
-    dim=D,
-    z_dim=D,
-    kernel_size=4,
-    k=16,
-    init_std=None,
-)
-```
-
-For `K` bases and kernel size `S`, the default initialization has standard deviation:
-
-```text
-fan_in_std = sqrt(K / (3 * S))
-```
-
-When using the larger fan-in initialization, scale the convolution learning rate proportionally with the initialization scale. This keeps the optimizer update in roughly the same regime relative to the parameter scale and is important for obtaining good performance.
-
-```text
-matched_lr = reference_lr * init_std / reference_std
-```
-
-Without downstream scale normalization, use the more conservative reference values:
-
-```text
-reference_std = 0.01
-reference_lr  = 1e-3
-```
-
-For `K = 16` and `S = 4`:
-
-```text
-fan_in_std ≈ 1.1547
-matched_lr ≈ 0.1155
-```
-
-This scaling moves the convolution learning rate into an appropriate range when changing the initialization scale. It is not meant to replace a learning-rate sweep within that range.
-
-Helpers are provided in `moc.optim`:
-
-```python
-from moc import (
-    moc_fan_in_std,
-    match_lr_to_init_std,
-    match_weight_decay_to_lr,
-)
-
-init_std = moc_fan_in_std(
-    k=16,
-    kernel_size=4,
-)
-
-conv_lr = match_lr_to_init_std(
-    init_std,
-    reference_std=0.01,
-    reference_lr=1e-3,
-)
-
-conv_weight_decay = match_weight_decay_to_lr(
-    conv_lr,
-    reference_lr=1e-3,
-    reference_weight_decay=0.1,
-)
-
-print(init_std)           # 1.1547...
-print(conv_lr)            # 0.1155...
-print(conv_weight_decay)  # 0.0008660...
-```
-
-The weight decay is scaled inversely with the learning rate so that AdamW applies the same per-step multiplicative shrinkage as the reference configuration.
+For example, with a normal AdamW learning rate of `1e-3`, weight decay of `0.1`, and convolution learning rate of `0.03`, use convolution weight decay of approximately `0.00333`.
 
 ## Autoregressive Decoding
 
-`MoC` supports cached single-token decoding:
-
 ```python
 cache = torch.zeros(
-    B,
-    D,
-    moc.kernel_size,
+    B, D, moc.kernel_size,
     device="cuda",
     dtype=torch.bfloat16,
 )
@@ -283,15 +62,9 @@ y, cache = moc.step(
 )
 ```
 
-where `x_t` and `z_t` have shape:
-
-```text
-[B, 1, D]
-```
+`x_t` and `z_t` have shapes `[B, 1, dim]` and `[B, 1, z_dim]`, respectively.
 
 ## Packed Variable-Length Sequences
-
-Packed variable-length sequences are supported through `cu_seqlens` and `max_seqlen`:
 
 ```python
 y, _ = moc(
@@ -302,40 +75,4 @@ y, _ = moc(
 )
 ```
 
-Packed inputs may use:
-
-```text
-x  [N, D]
-z  [N, z_dim]
-```
-
-where `N` is the total number of tokens across all packed sequences.
-
-## Files
-
-* `api.py` — public `MoC` module and `moc_triton` interface
-* `kernels.py` — fused Triton forward and backward kernels
-* `ops.py` — Triton kernel launch and dispatch logic
-* `reference.py` — PyTorch reference implementation
-* `optim.py` — initialization and learning-rate helpers
-* `verify.py` — correctness checks against the PyTorch reference
-
-Run the verification suite with:
-
-```bash
-python verify.py
-```
-
-## Citation
-
-```bibtex
-@misc{mouldon2026moc,
-    title={Mixture of Convolutions: Token-Adaptive Short Convolution for Sequence Modeling},
-    author={Andrew Mouldon},
-    year={2026},
-}
-```
-
-## License
-
-MIT.
+Packed inputs use `x` with shape `[N, dim]` and `z` with shape `[N, z_dim]`.
